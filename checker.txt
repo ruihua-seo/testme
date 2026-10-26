@@ -1,0 +1,1990 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Jint;
+
+namespace PACChecker
+{
+    public class Form1 : Form
+    {
+        private TextBox txtPacFile = null!;
+        private Label lblPacStatus = null!;
+        private TextBox txtUrl = null!;
+        private TextBox txtHost = null!;
+        private TextBox txtClientIp = null!;
+        private TextBox txtBatch = null!;
+        private RichTextBox txtCheck = null!;
+        private RichTextBox txtLogic = null!;
+        private RichTextBox txtResult = null!;
+        private DataGridView grid = null!;
+        private string pacSource = "";
+        private string pacPath = "";
+        private List<BatchResult> lastResults = new();
+
+        private readonly Dictionary<string, string> dnsCache =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public Form1()
+        {
+            Text = "PAC Checker V6.16";
+            Width = 1450;
+            Height = 900;
+            StartPosition = FormStartPosition.CenterScreen;
+            BuildUi();
+        }
+
+        private void BuildUi()
+        {
+            // Main layout: top PAC file row, middle test/check area, bottom batch area.
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 3,
+                Padding = new Padding(8)
+            };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
+            // Give the two PAC analysis result boxes substantially more height.
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 500));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            Controls.Add(root);
+
+            // ------------------------------------------------------------
+            // 1. PAC file row
+            // ------------------------------------------------------------
+            var filePanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 5,
+                RowCount = 1,
+                Padding = new Padding(4),
+                Margin = new Padding(0)
+            };
+            filePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+            filePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 590));
+            filePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
+            filePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
+            filePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+            txtPacFile = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Margin = new Padding(3)
+            };
+            var btnOpen = new Button { Text = "选择 PAC", Dock = DockStyle.Fill, Margin = new Padding(3) };
+            var btnCheck = new Button { Text = "检查 PAC", Dock = DockStyle.Fill, Margin = new Padding(3) };
+            var lbl = new Label
+            {
+                Text = "PAC 文件：",
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(0, 0, 4, 0)
+            };
+            lblPacStatus = new Label
+            {
+                Text = "未加载 PAC 文件",
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(8, 0, 0, 0)
+            };
+
+            btnOpen.Click += (_, _) => OpenPac();
+            btnCheck.Click += (_, _) => CheckPac();
+
+            filePanel.Controls.Add(lbl, 0, 0);
+            filePanel.Controls.Add(txtPacFile, 1, 0);
+            filePanel.Controls.Add(btnOpen, 2, 0);
+            filePanel.Controls.Add(btnCheck, 3, 0);
+            filePanel.Controls.Add(lblPacStatus, 4, 0);
+            root.Controls.Add(filePanel, 0, 0);
+            root.SetColumnSpan(filePanel, 2);
+
+            // ------------------------------------------------------------
+            // 2. Left top: single URL validation
+            // ------------------------------------------------------------
+            var testPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 4,
+                Padding = new Padding(4),
+                Margin = new Padding(0)
+            };
+            testPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+            testPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 590));
+
+            txtUrl = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Text = "https://www.example.com/",
+                Margin = new Padding(3)
+            };
+            txtHost = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Margin = new Padding(3)
+            };
+            txtClientIp = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Text = GetLocalIPv4(),
+                Margin = new Padding(3)
+            };
+            txtResult = new RichTextBox
+            {
+                Dock = DockStyle.Fill,
+                ReadOnly = true,
+                BackColor = System.Drawing.SystemColors.Window,
+                Margin = new Padding(3)
+            };
+
+            var btnTest = new Button
+            {
+                Text = "单条验证",
+                Width = 110,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(3)
+            };
+            btnTest.Click += async (_, _) => await TestOneAsync();
+
+            testPanel.Controls.Add(MakeLabel("URL："), 0, 0);
+            testPanel.Controls.Add(txtUrl, 1, 0);
+            testPanel.Controls.Add(MakeLabel("Host："), 0, 1);
+            testPanel.Controls.Add(txtHost, 1, 1);
+            testPanel.Controls.Add(MakeLabel("Client IP："), 0, 2);
+            testPanel.Controls.Add(txtClientIp, 1, 2);
+            testPanel.Controls.Add(btnTest, 0, 3);
+            testPanel.Controls.Add(txtResult, 1, 3);
+
+            var singleGroup = new GroupBox
+            {
+                Text = "（1）单条验证输入（请输入或粘贴完整的 URL）",
+                Dock = DockStyle.Fill,
+                Padding = new Padding(8),
+                Margin = new Padding(3)
+            };
+            singleGroup.Controls.Add(testPanel);
+
+            // ------------------------------------------------------------
+            // 3. Right: PAC file check + logic analysis
+            // ------------------------------------------------------------
+            var rightPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Padding = new Padding(4),
+                Margin = new Padding(0)
+            };
+            rightPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            rightPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+
+            txtCheck = NewOutputBox();
+            txtLogic = NewOutputBox();
+
+            var syntaxGroup = new GroupBox
+            {
+                Text = "A. PAC 文件检查（语法 / Helper）",
+                Dock = DockStyle.Fill,
+                Padding = new Padding(8),
+                Margin = new Padding(3)
+            };
+            syntaxGroup.Controls.Add(txtCheck);
+
+            var logicGroup = new GroupBox
+            {
+                Text = "B. PAC 逻辑分析（规则风险）",
+                Dock = DockStyle.Fill,
+                Padding = new Padding(8),
+                Margin = new Padding(3)
+            };
+            logicGroup.Controls.Add(txtLogic);
+
+            rightPanel.Controls.Add(syntaxGroup, 0, 0);
+            rightPanel.Controls.Add(logicGroup, 0, 1);
+            root.Controls.Add(rightPanel, 1, 1);
+
+            // ------------------------------------------------------------
+            // 4. Left bottom: batch URL input, immediately above batch results
+            // Buttons are placed to the left of the input box.
+            // ------------------------------------------------------------
+            const int maxBatchLines = 100;
+
+            var batchInputPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(0),
+                Margin = new Padding(0)
+            };
+            // Keep the batch input box exactly aligned with URL / Host / Client IP above.
+            batchInputPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+            batchInputPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 590));
+
+            var buttons = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Padding = new Padding(0),
+                Margin = new Padding(0)
+            };
+            buttons.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+            buttons.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+
+            var btnBatch = new Button
+            {
+                Text = "批量验证",
+                Width = 100,
+                Height = 30,
+                Anchor = AnchorStyles.Left | AnchorStyles.Top,
+                Margin = new Padding(3, 2, 3, 2)
+            };
+            var btnExport = new Button
+            {
+                Text = "导出 CSV",
+                Width = 100,
+                Height = 30,
+                Anchor = AnchorStyles.Left | AnchorStyles.Top,
+                Margin = new Padding(3, 2, 3, 2)
+            };
+            btnBatch.Click += async (_, _) => await TestBatchAsync();
+            btnExport.Click += (_, _) => ExportCsv();
+            buttons.Controls.Add(btnBatch, 0, 0);
+            buttons.Controls.Add(btnExport, 0, 1);
+
+            txtBatch = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ScrollBars = ScrollBars.Vertical,
+                Margin = new Padding(3),
+                Text = "https://www.example.com/\r\nhttps://www.google.com/\r\nhttps://www.microsoft.com/"
+            };
+
+            txtBatch.TextChanged += (_, _) =>
+            {
+                var lines = txtBatch.Lines;
+                if (lines.Length <= maxBatchLines) return;
+
+                var limited = string.Join(Environment.NewLine, lines.Take(maxBatchLines));
+                var caret = Math.Min(txtBatch.SelectionStart, limited.Length);
+                txtBatch.Text = limited;
+                txtBatch.SelectionStart = caret;
+                txtBatch.SelectionLength = 0;
+            };
+
+            batchInputPanel.Controls.Add(buttons, 0, 0);
+            batchInputPanel.Controls.Add(txtBatch, 1, 0);
+
+            var batchGroup = new GroupBox
+            {
+                Text = $"（2）批量验证输入（每条输入一行，最多 {maxBatchLines} 行）",
+                Dock = DockStyle.Fill,
+                Padding = new Padding(8),
+                Margin = new Padding(3)
+            };
+            batchGroup.Controls.Add(batchInputPanel);
+
+            // Single validation is above; batch input is directly above batch results.
+            var leftMiddle = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Padding = new Padding(0),
+                Margin = new Padding(0)
+            };
+            leftMiddle.RowStyles.Add(new RowStyle(SizeType.Percent, 40));
+            leftMiddle.RowStyles.Add(new RowStyle(SizeType.Percent, 60));
+            leftMiddle.Controls.Add(singleGroup, 0, 0);
+            leftMiddle.Controls.Add(batchGroup, 0, 1);
+            root.Controls.Add(leftMiddle, 0, 1);
+
+            // ------------------------------------------------------------
+            // 5. Bottom: batch validation results
+            // ------------------------------------------------------------
+            grid = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                ReadOnly = true,
+                AllowUserToAddRows = false,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                Margin = new Padding(3)
+            };
+            grid.Columns.Add("No", "No.");
+            grid.Columns.Add("Url", "URL");
+            grid.Columns.Add("Host", "Host");
+            grid.Columns.Add("Dns", "目标IP");
+            grid.Columns.Add("Result", "Result");
+            grid.Columns.Add("Action", "Action");
+            grid.Columns.Add("Line", "PAC Line");
+            grid.Columns.Add("Condition", "命中规则");
+
+            grid.Columns["No"].AutoSizeMode = DataGridViewAutoSizeColumnMode.None;
+            grid.Columns["No"].Width = 35;
+            grid.Columns["Action"].AutoSizeMode = DataGridViewAutoSizeColumnMode.None;
+            grid.Columns["Action"].Width = 65;
+            grid.Columns["Condition"].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+            grid.Columns["Condition"].MinimumWidth = 360;
+            grid.Columns["Url"].MinimumWidth = 250;
+            grid.Columns["Host"].MinimumWidth = 150;
+            grid.Columns["Dns"].MinimumWidth = 150;
+            grid.Columns["Result"].MinimumWidth = 210;
+            grid.Columns["Line"].MinimumWidth = 75;
+
+            root.Controls.Add(grid, 0, 2);
+            root.SetColumnSpan(grid, 2);
+
+            txtUrl.TextChanged += (_, _) => TrySetHostFromUrl();
+            TrySetHostFromUrl();
+        }
+
+        private static Label MakeLabel(string text)
+        {
+            return new Label
+            {
+                Text = text,
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(0, 0, 4, 0),
+                Margin = new Padding(3)
+            };
+        }
+
+        private RichTextBox NewOutputBox()
+        {
+            return new RichTextBox
+            {
+                Dock = DockStyle.Fill,
+                ReadOnly = true,
+                Font = new System.Drawing.Font("Consolas", 10),
+                BackColor = System.Drawing.SystemColors.Window,
+                Margin = new Padding(3)
+            };
+        }
+
+        private void OpenPac()
+        {
+            using var dlg = new OpenFileDialog
+            {
+                Filter = "PAC files (*.pac;*.js;*.txt)|*.pac;*.js;*.txt|All files (*.*)|*.*"
+            };
+
+            if (dlg.ShowDialog() != DialogResult.OK)
+                return;
+
+            pacPath = dlg.FileName;
+            txtPacFile.Text = pacPath;
+
+            try
+            {
+                pacSource = File.ReadAllText(pacPath, DetectEncoding(pacPath));
+                lblPacStatus.Text = $"✓ 已加载：{Path.GetFileName(pacPath)}（{pacSource.Replace("\r\n", "\n").Split('\n').Length} 行）";
+                CheckPac();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("读取 PAC 失败：\r\n" + ex.Message);
+            }
+        }
+
+        private static Encoding DetectEncoding(string path)
+        {
+            byte[] b = File.ReadAllBytes(path);
+            if (b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF)
+                return new UTF8Encoding(true);
+            if (b.Length >= 2 && b[0] == 0xFF && b[1] == 0xFE)
+                return Encoding.Unicode;
+            if (b.Length >= 2 && b[0] == 0xFE && b[1] == 0xFF)
+                return Encoding.BigEndianUnicode;
+            return new UTF8Encoding(false);
+        }
+
+        private void CheckPac()
+        {
+            if (string.IsNullOrWhiteSpace(pacSource) && File.Exists(txtPacFile.Text))
+            {
+                pacPath = txtPacFile.Text.Trim();
+                pacSource = File.ReadAllText(pacPath, DetectEncoding(pacPath));
+                lblPacStatus.Text = $"✓ 已加载：{Path.GetFileName(pacPath)}（{pacSource.Replace("\r\n", "\n").Split('\n').Length} 行）";
+            }
+
+            if (string.IsNullOrWhiteSpace(pacSource))
+            {
+                MessageBox.Show("请先选择 PAC 文件。");
+                return;
+            }
+
+            int lines = pacSource.Replace("\r\n", "\n").Split('\n').Length;
+            var check = new StringBuilder();
+
+            check.AppendLine("PAC 文件检查");
+            check.AppendLine("================================");
+            check.AppendLine($"文件：{(string.IsNullOrWhiteSpace(pacPath) ? "(未保存)" : pacPath)}");
+            check.AppendLine($"行数：{lines}");
+            check.AppendLine();
+
+            bool braces = CheckPairs(pacSource, '{', '}');
+            bool parens = CheckPairs(pacSource, '(', ')');
+            bool brackets = CheckPairs(pacSource, '[', ']');
+            bool strings = CheckStrings(pacSource);
+            bool function = Regex.IsMatch(
+                RemoveComments(pacSource),
+                @"function\s+FindProxyForURL\s*\(",
+                RegexOptions.IgnoreCase);
+
+            check.AppendLine((braces ? "✓" : "✗") + " { } 匹配：" + (braces ? "正常" : "异常"));
+            check.AppendLine((parens ? "✓" : "✗") + " ( ) 匹配：" + (parens ? "正常" : "异常"));
+            check.AppendLine((brackets ? "✓" : "✗") + " [ ] 匹配：" + (brackets ? "正常" : "异常"));
+            check.AppendLine((strings ? "✓" : "✗") + " 字符串引号：" + (strings ? "正常" : "异常"));
+            check.AppendLine((function ? "✓" : "✗") + " FindProxyForURL：" + (function ? "存在" : "未找到"));
+
+            bool jintOk = false;
+            string jintError = "";
+
+            try
+            {
+                var engine = new Engine();
+                engine.Execute(RemovePacFunctionBodyForSyntaxTest(pacSource));
+                jintOk = true;
+            }
+            catch (Exception ex)
+            {
+                jintError = ex.Message;
+            }
+
+            check.AppendLine((jintOk ? "✓" : "✗") + " JavaScript/Jint 语法：" +
+                             (jintOk ? "正常" : "异常"));
+            if (!jintOk)
+                check.AppendLine("  " + jintError);
+
+            check.AppendLine();
+            check.Append(BuildLineSyntaxHints(pacSource));
+            check.AppendLine();
+            check.AppendLine("PAC Helper 使用检查：");
+
+            string[] helpers =
+            {
+                "shExpMatch", "dnsDomainIs", "dnsResolve", "isResolvable",
+                "myIpAddress", "isPlainHostName"
+            };
+
+            foreach (string h in helpers)
+            {
+                int count = Regex.Matches(
+                    RemoveComments(pacSource),
+                    @"\b" + Regex.Escape(h) + @"\s*\(",
+                    RegexOptions.IgnoreCase).Count;
+
+                check.AppendLine(count > 0
+                    ? $"✓ {h}：使用 {count} 次"
+                    : $"  {h}：未使用");
+            }
+
+            check.AppendLine();
+            check.Append(CheckPacCommentIssues());
+
+            txtCheck.Text = check.ToString();
+
+            var logic = AnalyzeLogic(pacSource);
+            txtLogic.Text = logic;
+        }
+
+        private static string BuildLineSyntaxHints(string source)
+        {
+            var sb = new StringBuilder();
+            var lines = source.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+
+            // 真正的 JavaScript/PAC 词法扫描：
+            // 只有在正常代码状态下才统计 {}、()、[]。
+            // 字符串、// 注释、/* */ 注释中的括号全部忽略。
+            var braces = new Stack<(int Line, string Text, bool FunctionOuter)>();
+            var parens = new Stack<(int Line, string Text)>();
+            var brackets = new Stack<(int Line, string Text)>();
+
+            int issues = 0;
+            bool blockComment = false;
+            char quote = '\0';
+            int quoteLine = 0;
+            bool escaped = false;
+
+            bool findProxyDeclaration = false;
+            bool functionOuterMarked = false;
+            int lastCodeLine = 0;
+
+            // 记录“单行 if 开始了 {，但本行没有 }”的候选。
+            // 这种情况非常适合定位用户故意删除的 }。
+            var singleLineBlockCandidates = new List<(int Line, string Text)>();
+
+            for (int li = 0; li < lines.Length; li++)
+            {
+                string line = lines[li];
+                string trimmed = line.Trim();
+                bool lineHadOpenBrace = false;
+                bool lineHadCloseBrace = false;
+                int openBraceCount = 0;
+                int closeBraceCount = 0;
+
+                for (int i = 0; i < line.Length; i++)
+                {
+                    char c = line[i];
+                    char n = i + 1 < line.Length ? line[i + 1] : '\0';
+
+                    if (blockComment)
+                    {
+                        if (c == '*' && n == '/')
+                        {
+                            blockComment = false;
+                            i++;
+                        }
+                        continue;
+                    }
+
+                    if (quote != '\0')
+                    {
+                        if (escaped)
+                        {
+                            escaped = false;
+                            continue;
+                        }
+
+                        if (c == '\\')
+                        {
+                            escaped = true;
+                            continue;
+                        }
+
+                        if (c == quote)
+                        {
+                            quote = '\0';
+                            quoteLine = 0;
+                        }
+                        continue;
+                    }
+
+                    if (c == '/' && n == '*')
+                    {
+                        blockComment = true;
+                        i++;
+                        continue;
+                    }
+
+                    if (c == '/' && n == '/')
+                        break;
+
+                    if (c == '"' || c == '\'')
+                    {
+                        quote = c;
+                        quoteLine = li + 1;
+                        escaped = false;
+                        continue;
+                    }
+
+                    // FindProxyForURL 的 { 可以在下一行。
+                    if (!findProxyDeclaration &&
+                        Regex.IsMatch(
+                            line[..(i + 1)],
+                            @"\bfunction\s+FindProxyForURL\s*\(",
+                            RegexOptions.IgnoreCase))
+                    {
+                        findProxyDeclaration = true;
+                        lastCodeLine = li + 1;
+                    }
+
+                    if (c == '{')
+                    {
+                        bool outer = findProxyDeclaration && !functionOuterMarked;
+
+                        if (outer)
+                        {
+                            functionOuterMarked = true;
+                            findProxyDeclaration = false;
+                        }
+
+                        braces.Push((li + 1, trimmed, outer));
+                        lineHadOpenBrace = true;
+                        openBraceCount++;
+                    }
+                    else if (c == '}')
+                    {
+                        lineHadCloseBrace = true;
+                        closeBraceCount++;
+
+                        if (braces.Count == 0)
+                        {
+                            issues++;
+                            sb.AppendLine($"[高] Line {li + 1}：多余的 }}");
+                            sb.AppendLine($"    {trimmed}");
+                            sb.AppendLine("    建议：检查这一行是否多写了 }。");
+                        }
+                        else
+                        {
+                            braces.Pop();
+                        }
+                    }
+                    else if (c == '(')
+                    {
+                        parens.Push((li + 1, trimmed));
+                    }
+                    else if (c == ')')
+                    {
+                        if (parens.Count == 0)
+                        {
+                            issues++;
+                            sb.AppendLine($"[高] Line {li + 1}：多余的 )");
+                            sb.AppendLine($"    {trimmed}");
+                        }
+                        else
+                        {
+                            parens.Pop();
+                        }
+                    }
+                    else if (c == '[')
+                    {
+                        brackets.Push((li + 1, trimmed));
+                    }
+                    else if (c == ']')
+                    {
+                        if (brackets.Count == 0)
+                        {
+                            issues++;
+                            sb.AppendLine($"[高] Line {li + 1}：多余的 ]");
+                            sb.AppendLine($"    {trimmed}");
+                        }
+                        else
+                        {
+                            brackets.Pop();
+                        }
+                    }
+                }
+
+                // 典型 PAC 写法：
+                // if (...) {return "DIRECT";}
+                // 如果出现 { 但同一行没有 }，高度疑似人为漏写 }。
+                if (lineHadOpenBrace &&
+                    !lineHadCloseBrace &&
+                    Regex.IsMatch(trimmed, @"^\s*if\s*\(", RegexOptions.IgnoreCase))
+                {
+                    singleLineBlockCandidates.Add((li + 1, trimmed));
+                }
+            }
+
+            if (quote != '\0')
+            {
+                issues++;
+                sb.AppendLine($"[高] Line {quoteLine}：字符串引号未闭合");
+                sb.AppendLine("    建议：检查是否遗漏结束引号。");
+            }
+
+            if (blockComment)
+            {
+                issues++;
+                sb.AppendLine($"[高] Line {lines.Length}：块注释未闭合");
+                sb.AppendLine("    建议：检查是否遗漏 */。");
+            }
+
+            // 如果 EOF 时只剩 FindProxyForURL 外层 {，
+            // 说明某个内部 { 很可能被后面的 }“借位关闭”了。
+            // 优先利用“单行 if { 无 }”候选进行准确定位。
+            var internalBraces = braces.Where(x => !x.FunctionOuter).ToArray();
+
+            if (internalBraces.Length > 0)
+            {
+                var likely = internalBraces[0];
+                issues++;
+                sb.AppendLine($"[高] Line {likely.Line}：疑似缺少 }}");
+                sb.AppendLine($"    {likely.Text}");
+                sb.AppendLine("    建议：检查该行开始的代码块是否遗漏了 }。");
+                sb.AppendLine($"    文件结束时仍有 {internalBraces.Length} 个内部花括号未闭合。");
+            }
+            else if (braces.Count > 0 && braces.All(x => x.FunctionOuter))
+            {
+                if (singleLineBlockCandidates.Count > 0)
+                {
+                    // 最靠近文件末尾的候选通常就是被错误借位关闭的代码块。
+                    var candidate = singleLineBlockCandidates[^1];
+                    issues++;
+                    sb.AppendLine($"[高] Line {candidate.Line}：疑似缺少 }}");
+                    sb.AppendLine($"    {candidate.Text}");
+                    sb.AppendLine("    建议：该行存在 { 但本行没有对应的 }，请检查是否遗漏了块结束符。");
+                }
+                else
+                {
+                    // 没有可靠候选时，不把 Line 2 的函数外层 { 当成错误。
+                    sb.AppendLine("✓ FindProxyForURL 外层花括号已识别，不作为错误定位。");
+                }
+            }
+
+            foreach (var item in parens.Reverse())
+            {
+                issues++;
+                sb.AppendLine($"[高] Line {item.Line}：圆括号 ( 未闭合");
+                sb.AppendLine($"    {item.Text}");
+                sb.AppendLine("    建议：检查该表达式是否缺少 )。");
+            }
+
+            foreach (var item in brackets.Reverse())
+            {
+                issues++;
+                sb.AppendLine($"[高] Line {item.Line}：方括号 [ 未闭合");
+                sb.AppendLine($"    {item.Text}");
+                sb.AppendLine("    建议：检查该表达式是否缺少 ]。");
+            }
+
+            // PAC 常见错误：return 后缺少分号。
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string original = lines[i];
+                string trimmed = original.Trim();
+
+                if (trimmed.Length == 0 || trimmed.StartsWith("//", StringComparison.Ordinal))
+                    continue;
+
+                int commentPos = FindLineCommentOutsideStrings(original);
+                string code = commentPos >= 0 ? original[..commentPos] : original;
+
+                if (LooksLikeReturnWithoutSemicolon(code))
+                {
+                    issues++;
+                    sb.AppendLine($"[高] Line {i + 1}：return 语句疑似缺少分号 ;");
+                    sb.AppendLine($"    {trimmed}");
+                    sb.AppendLine("    建议：在 return 返回值后补充 ;");
+                }
+            }
+
+            if (issues == 0)
+                sb.AppendLine("✓ 未发现可明确定位的常见语法/修改错误。");
+            else
+                sb.Insert(0, $"⚠ 发现 {issues} 个可定位的问题：\r\n");
+
+            return sb.ToString();
+        }
+
+        private static string RemovePacFunctionBodyForSyntaxTest(string source)
+        {
+            // Jint can parse the whole PAC directly. PAC helper calls are not executed here.
+            // A declaration-only wrapper avoids executing FindProxyForURL during syntax checking.
+            return source;
+        }
+
+        private static bool CheckPairs(string source, char open, char close)
+        {
+            int depth = 0;
+            bool inSingle = false, inDouble = false, inLine = false, inBlock = false, escape = false;
+
+            for (int i = 0; i < source.Length; i++)
+            {
+                char c = source[i];
+                char n = i + 1 < source.Length ? source[i + 1] : '\0';
+
+                if (inLine)
+                {
+                    if (c == '\n') inLine = false;
+                    continue;
+                }
+
+                if (inBlock)
+                {
+                    if (c == '*' && n == '/')
+                    {
+                        inBlock = false;
+                        i++;
+                    }
+                    continue;
+                }
+
+                if (!inSingle && !inDouble && c == '/' && n == '/')
+                {
+                    inLine = true;
+                    i++;
+                    continue;
+                }
+
+                if (!inSingle && !inDouble && c == '/' && n == '*')
+                {
+                    inBlock = true;
+                    i++;
+                    continue;
+                }
+
+                if (escape)
+                {
+                    escape = false;
+                    continue;
+                }
+
+                if ((inSingle || inDouble) && c == '\\')
+                {
+                    escape = true;
+                    continue;
+                }
+
+                if (!inDouble && c == '\'') { inSingle = !inSingle; continue; }
+                if (!inSingle && c == '"') { inDouble = !inDouble; continue; }
+
+                if (!inSingle && !inDouble)
+                {
+                    if (c == open) depth++;
+                    else if (c == close)
+                    {
+                        depth--;
+                        if (depth < 0) return false;
+                    }
+                }
+            }
+
+            return !inSingle && !inDouble && !inBlock && depth == 0;
+        }
+
+        private static bool CheckStrings(string source)
+        {
+            bool single = false, dbl = false, escape = false, line = false, block = false;
+
+            for (int i = 0; i < source.Length; i++)
+            {
+                char c = source[i];
+                char n = i + 1 < source.Length ? source[i + 1] : '\0';
+
+                if (line)
+                {
+                    if (c == '\n') line = false;
+                    continue;
+                }
+
+                if (block)
+                {
+                    if (c == '*' && n == '/')
+                    {
+                        block = false;
+                        i++;
+                    }
+                    continue;
+                }
+
+                if (!single && !dbl && c == '/' && n == '/')
+                {
+                    line = true;
+                    i++;
+                    continue;
+                }
+
+                if (!single && !dbl && c == '/' && n == '*')
+                {
+                    block = true;
+                    i++;
+                    continue;
+                }
+
+                if (escape)
+                {
+                    escape = false;
+                    continue;
+                }
+
+                if ((single || dbl) && c == '\\')
+                {
+                    escape = true;
+                    continue;
+                }
+
+                if (!dbl && c == '\'') single = !single;
+                else if (!single && c == '"') dbl = !dbl;
+            }
+
+            return !single && !dbl && !block && !escape;
+        }
+
+        private string AnalyzeLogic(string source)
+        {
+            var result = new StringBuilder();
+            result.AppendLine("PAC 逻辑分析");
+            result.AppendLine("================================");
+
+            var rules = ExtractRules(source);
+            if (rules.Count == 0)
+            {
+                result.AppendLine("✓ 未识别到可分析的 if / return 规则。");
+                return result.ToString();
+            }
+
+            var high = new List<string>();
+            var medium = new List<string>();
+            var low = new List<string>();
+
+            // 1. 前置规则覆盖后置规则。
+            // 相同返回值 = 冗余（低）；不同返回值 = 潜在逻辑冲突（高）。
+            for (int i = 0; i < rules.Count; i++)
+            {
+                var current = rules[i];
+
+                for (int j = 0; j < i; j++)
+                {
+                    var previous = rules[j];
+
+                    // Only prove "full coverage" when both rules are simple,
+                    // single-condition rules of the same type. A compound rule such
+                    // as (cip == X) && dnsDomainIs(host, "naver.com") must NOT be
+                    // treated as covering a domain-only rule.
+                    bool previousSimple =
+                        previous.ConditionKey.StartsWith("DOMAIN:", StringComparison.OrdinalIgnoreCase) ||
+                        previous.ConditionKey.StartsWith("IP:", StringComparison.OrdinalIgnoreCase);
+
+                    bool currentSimple =
+                        current.ConditionKey.StartsWith("DOMAIN:", StringComparison.OrdinalIgnoreCase) ||
+                        current.ConditionKey.StartsWith("IP:", StringComparison.OrdinalIgnoreCase);
+
+                    bool previousCompound = IsCompoundCondition(previous.Text);
+                    bool currentCompound = IsCompoundCondition(current.Text);
+
+                    bool covered =
+                        previousSimple &&
+                        currentSimple &&
+                        !previousCompound &&
+                        !currentCompound &&
+                        (
+                            (previous.Kind == RuleKind.Domain &&
+                             current.Kind == RuleKind.Domain &&
+                             IsDomainRuleCovered(previous.Value, current.Value))
+                            ||
+                            (previous.Kind == RuleKind.Ip &&
+                             current.Kind == RuleKind.Ip &&
+                             IsIpPatternCovered(previous.Value, current.Value))
+                        );
+
+                    if (!covered)
+                        continue;
+
+                    bool sameReturn = NormalizeReturnValue(previous.ReturnValue)
+                        .Equals(NormalizeReturnValue(current.ReturnValue),
+                            StringComparison.OrdinalIgnoreCase);
+
+                    string block =
+                        $"Line {current.Line}：当前规则被前面的规则完全覆盖\n" +
+                        $"     前面：{previous.Text.Trim()}\n" +
+                        $"     当前：{current.Text.Trim()}\n" +
+                        (sameReturn
+                            ? "     说明：两条规则返回结果相同，当前规则属于冗余规则，可考虑删除。"
+                            : "     说明：两条规则返回结果不同，当前规则实际上不可达，可能存在规则顺序错误。");
+
+                    if (sameReturn)
+                        low.Add(block);
+                    else
+                        high.Add(block);
+
+                    break;
+                }
+            }
+
+            // 2. 完全重复规则：低风险/冗余。
+            var duplicateGroups = rules
+                .GroupBy(r => $"{r.Kind}|{r.Value}|{NormalizeReturnValue(r.ReturnValue)}",
+                    StringComparer.OrdinalIgnoreCase)
+                .Where(g => g.Count() > 1)
+                .ToList();
+
+            foreach (var group in duplicateGroups)
+            {
+                var list = group.OrderBy(x => x.Line).ToList();
+                low.Add(
+                    $"重复规则：Line {string.Join(", ", list.Select(x => x.Line))}\n" +
+                    $"     {list[0].Text.Trim()}\n" +
+                    "     说明：条件和返回结果完全相同，后面的重复规则没有额外效果。");
+            }
+
+            // 3. 相同条件不同返回值：高风险。
+            // This is deliberately based on the extracted condition key/type,
+            // so compound conditions are not confused with domain-only rules.
+            var conflictingGroups = rules
+                .GroupBy(r => $"{r.Kind}|{r.Value}", StringComparer.OrdinalIgnoreCase)
+                .Where(g => g.Select(x => NormalizeReturnValue(x.ReturnValue))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1)
+                .ToList();
+
+            foreach (var group in conflictingGroups)
+            {
+                var list = group.OrderBy(x => x.Line).ToList();
+                var sb = new StringBuilder();
+                sb.AppendLine($"冲突规则：Line {string.Join(", ", list.Select(x => x.Line))}");
+                foreach (var r in list)
+                    sb.AppendLine($"     Line {r.Line}：{r.Text.Trim()}");
+                sb.Append("     说明：相同条件返回不同结果，实际生效的是最先命中的 return。");
+                high.Add(sb.ToString());
+            }
+
+            // 4. return 后明显不可达代码：中风险。
+            foreach (var item in ExtractReturnFlowRisks(source))
+            {
+                medium.Add(
+                    $"Line {item.Line}：return 后仍存在同级代码\n" +
+                    $"     return：{item.ReturnText}\n" +
+                    $"     后续：{item.NextText}\n" +
+                    "     说明：如果没有新的代码块/else 结构，该后续代码可能不可执行。");
+            }
+
+            // 5. 最终无条件 return：提示，不算风险。
+            var unconditional = rules
+                .Where(r => r.IsUnconditionalReturn)
+                .OrderByDescending(r => r.Line)
+                .FirstOrDefault();
+
+            // 6. 汇总
+            result.AppendLine($"【高风险】 {high.Count} 项");
+            result.AppendLine($"【中风险】 {medium.Count} 项");
+            result.AppendLine($"【低风险 / 冗余】 {low.Count} 项");
+            result.AppendLine($"【提示】 {(unconditional != null ? 1 : 0)} 项");
+            result.AppendLine();
+
+            AppendRiskSection(result, "高风险", high);
+            AppendRiskSection(result, "中风险", medium);
+            AppendRiskSection(result, "低风险 / 冗余", low);
+
+            if (unconditional != null)
+            {
+                result.AppendLine("--------------------------------");
+                result.AppendLine("提示");
+                result.AppendLine("--------------------------------");
+                result.AppendLine($"Line {unconditional.Line}：存在无条件默认返回");
+                result.AppendLine($"     {unconditional.Text.Trim()}");
+                result.AppendLine("     说明：所有前面条件均未命中时将执行该默认策略。");
+            }
+
+            result.AppendLine();
+            if (high.Count == 0 && medium.Count == 0)
+                result.AppendLine("✓ 未发现明显的高风险/中风险逻辑问题。");
+            else
+                result.AppendLine($"⚠ 发现 {high.Count + medium.Count} 项需要重点关注的逻辑问题。");
+
+            return result.ToString();
+        }
+
+        private static void AppendRiskSection(StringBuilder result, string title, List<string> items)
+        {
+            result.AppendLine("--------------------------------");
+            result.AppendLine(title);
+            result.AppendLine("--------------------------------");
+
+            if (items.Count == 0)
+            {
+                result.AppendLine("✓ 无");
+                return;
+            }
+
+            foreach (var item in items)
+            {
+                result.AppendLine(item);
+                result.AppendLine();
+            }
+        }
+
+
+        private static string NormalizeReturnValue(string value)
+        {
+            return (value ?? "").Trim();
+        }
+
+        private sealed class ReturnFlowRisk
+        {
+            public int Line { get; init; }
+            public string ReturnText { get; init; } = "";
+            public string NextText { get; init; } = "";
+        }
+
+        private static List<ReturnFlowRisk> ExtractReturnFlowRisks(string source)
+        {
+            var risks = new List<ReturnFlowRisk>();
+            var lines = source.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+
+            bool blockComment = false;
+
+            for (int i = 0; i < lines.Length - 1; i++)
+            {
+                string code = StripCommentsForLogic(lines[i], ref blockComment);
+                string next = StripCommentsForLogic(lines[i + 1], ref blockComment);
+
+                string t = code.Trim();
+                string nt = next.Trim();
+
+                if (t.Length == 0 || nt.Length == 0)
+                    continue;
+
+                if (!Regex.IsMatch(t, @"^\s*(?:if\s*\([^)]*\)\s*)?\{\s*return\b",
+                    RegexOptions.IgnoreCase) &&
+                    !Regex.IsMatch(t, @"^\s*return\b", RegexOptions.IgnoreCase))
+                    continue;
+
+                if (nt.StartsWith("}", StringComparison.Ordinal) ||
+                    nt.StartsWith("else", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (Regex.IsMatch(nt,
+                    @"^(if|return|var|let|const|[A-Za-z_]\w*\s*=|[A-Za-z_]\w*\s*\()",
+                    RegexOptions.IgnoreCase))
+                {
+                    risks.Add(new ReturnFlowRisk
+                    {
+                        Line = i + 1,
+                        ReturnText = t,
+                        NextText = nt
+                    });
+                }
+            }
+
+            return risks;
+        }
+
+        private static string StripCommentsForLogic(string line, ref bool blockComment)
+        {
+            var sb = new StringBuilder();
+            bool single = false;
+            bool dbl = false;
+            bool escape = false;
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                char n = i + 1 < line.Length ? line[i + 1] : '\0';
+
+                if (blockComment)
+                {
+                    if (c == '*' && n == '/')
+                    {
+                        blockComment = false;
+                        i++;
+                    }
+                    continue;
+                }
+
+                if (!single && !dbl && c == '/' && n == '*')
+                {
+                    blockComment = true;
+                    i++;
+                    continue;
+                }
+
+                if (!single && !dbl && c == '/' && n == '/')
+                    break;
+
+                if (escape)
+                {
+                    escape = false;
+                    sb.Append(c);
+                    continue;
+                }
+
+                if ((single || dbl) && c == '\\')
+                {
+                    escape = true;
+                    sb.Append(c);
+                    continue;
+                }
+
+                if (!dbl && c == '\'') single = !single;
+                else if (!single && c == '"') dbl = !dbl;
+
+                sb.Append(c);
+            }
+
+            return sb.ToString();
+        }
+
+        private static bool IsCompoundCondition(string line)
+        {
+            string s = StripComment(line).Trim();
+
+            // Extract the portion before return. This is the actual if-condition
+            // plus braces/parentheses. Any logical operator means the rule has
+            // additional constraints and cannot safely be declared "fully covered"
+            // by comparing only one domain/IP operand.
+            int returnPos = Regex.Match(s, @"\breturn\b", RegexOptions.IgnoreCase).Index;
+            if (returnPos <= 0)
+                return false;
+
+            string condition = s[..returnPos];
+
+            return condition.Contains("&&", StringComparison.Ordinal) ||
+                   condition.Contains("||", StringComparison.Ordinal);
+        }
+
+        private static bool IsDomainRuleCovered(string previous, string current)
+        {
+            string p = previous.Trim().TrimEnd('.');
+            string c = current.Trim().TrimEnd('.');
+
+            if (p.Length == 0 || c.Length == 0)
+                return false;
+
+            return c.Equals(p, StringComparison.OrdinalIgnoreCase) ||
+                   c.EndsWith("." + p, StringComparison.OrdinalIgnoreCase);
+        }
+
+
+        private static List<PacRule> ExtractRules(string source)
+        {
+            var list = new List<PacRule>();
+            string[] lines = source.Replace("\r\n", "\n").Split('\n');
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i];
+                string clean = StripComment(line).Trim();
+
+                if (clean.Length == 0)
+                    continue;
+
+                var mIp = Regex.Match(
+                    clean,
+                    @"shExpMatch\s*\(\s*dip\s*,\s*[""']([^""']+)[""']\s*\)",
+                    RegexOptions.IgnoreCase);
+
+                if (mIp.Success)
+                {
+                    string ret = GetReturnValue(clean);
+                    list.Add(new PacRule
+                    {
+                        Line = i + 1,
+                        Text = line,
+                        Kind = RuleKind.Ip,
+                        Value = mIp.Groups[1].Value,
+                        ReturnValue = ret,
+                        IsUnconditionalReturn = false,
+                        ConditionKey = "IP:" + mIp.Groups[1].Value,
+                        ConditionText = GetConditionText(clean)
+                    });
+                    continue;
+                }
+
+                var mDomain = Regex.Match(
+                    clean,
+                    @"dnsDomainIs\s*\(\s*host\s*,\s*[""']([^""']+)[""']\s*\)",
+                    RegexOptions.IgnoreCase);
+
+                if (mDomain.Success)
+                {
+                    string ret = GetReturnValue(clean);
+                    list.Add(new PacRule
+                    {
+                        Line = i + 1,
+                        Text = line,
+                        Kind = RuleKind.Domain,
+                        Value = mDomain.Groups[1].Value,
+                        ReturnValue = ret,
+                        IsUnconditionalReturn = false,
+                        ConditionKey = "DOMAIN:" + mDomain.Groups[1].Value,
+                        ConditionText = GetConditionText(clean)
+                    });
+                    continue;
+                }
+
+                if (Regex.IsMatch(clean, @"^\s*return\s+[""']", RegexOptions.IgnoreCase))
+                {
+                    list.Add(new PacRule
+                    {
+                        Line = i + 1,
+                        Text = line,
+                        Kind = RuleKind.Other,
+                        Value = "",
+                        ReturnValue = GetReturnValue(clean),
+                        IsUnconditionalReturn = true,
+                        ConditionKey = "",
+                        ConditionText = ""
+                    });
+                }
+            }
+
+            return list;
+        }
+
+        private static string GetConditionText(string line)
+        {
+            int pos = Regex.Match(line, @"\breturn\b", RegexOptions.IgnoreCase).Index;
+            if (pos <= 0)
+                return "";
+
+            string condition = line[..pos].Trim();
+            condition = condition.TrimEnd('{', ' ', '\t');
+            return Regex.Replace(condition, @"\s+", " ").Trim();
+        }
+
+        private static string GetReturnValue(string line)
+        {
+            var m = Regex.Match(line, @"return\s+[""']([^""']+)[""']", RegexOptions.IgnoreCase);
+            return m.Success ? m.Groups[1].Value : "";
+        }
+
+        private static bool IsDomainCovered(string broad, string narrow)
+        {
+            string b = broad.Trim().TrimEnd('.').ToLowerInvariant();
+            string n = narrow.Trim().TrimEnd('.').ToLowerInvariant();
+
+            if (b == n) return true;
+            return n.EndsWith("." + b, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsIpPatternCovered(string broad, string narrow)
+        {
+            string[] a = broad.Split('.');
+            string[] b = narrow.Split('.');
+
+            if (a.Length != 4 || b.Length != 4)
+                return false;
+
+            for (int i = 0; i < 4; i++)
+            {
+                if (a[i] == "*")
+                    continue;
+
+                if (!string.Equals(a[i], b[i], StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private async Task TestOneAsync()
+        {
+            if (string.IsNullOrWhiteSpace(pacSource))
+            {
+                MessageBox.Show("请先选择 PAC 文件。");
+                return;
+            }
+
+            TrySetHostFromUrl();
+
+            string url = txtUrl.Text.Trim();
+            string host = txtHost.Text.Trim();
+
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            {
+                MessageBox.Show("URL 格式不正确。");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(host))
+                host = uri.Host;
+
+            txtResult.Text = "正在执行 PAC...\r\n";
+
+            try
+            {
+                PacExecutionResult r = await Task.Run(() => ExecutePac(url, host, txtClientIp.Text.Trim()));
+                txtResult.Text = FormatResult(r);
+            }
+            catch (Exception ex)
+            {
+                txtResult.Text = "执行失败：\r\n" + ex;
+            }
+        }
+
+        private async Task TestBatchAsync()
+        {
+            if (string.IsNullOrWhiteSpace(pacSource))
+            {
+                MessageBox.Show("请先选择 PAC 文件。");
+                return;
+            }
+
+            string[] urls = txtBatch.Text
+                .Replace("\r\n", "\n")
+                .Split('\n')
+                .Select(x => x.Trim())
+                .Where(x => x.Length > 0)
+                .ToArray();
+
+            grid.Rows.Clear();
+            lastResults.Clear();
+
+            foreach (string url in urls)
+            {
+                try
+                {
+                    if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+                    {
+                        var bad = new BatchResult
+                        {
+                            No = lastResults.Count + 1,
+                            Url = url,
+                            Host = "",
+                            Dns = "",
+                            Result = "URL格式错误",
+                            Action = "ERROR",
+                            Line = 0,
+                            Condition = ""
+                        };
+                        lastResults.Add(bad);
+                        AddGrid(bad);
+                        continue;
+                    }
+
+                    var r = await Task.Run(() =>
+                        ExecutePac(url, uri.Host, txtClientIp.Text.Trim()));
+
+                    var row = new BatchResult
+                    {
+                        No = lastResults.Count + 1,
+                        Url = url,
+                        Host = r.Host,
+                        Dns = r.Dns,
+                        Result = r.Result,
+                        Action = r.Action,
+                        Line = r.Line,
+                        Condition = r.Condition
+                    };
+
+                    lastResults.Add(row);
+                    AddGrid(row);
+                }
+                catch (Exception ex)
+                {
+                    var bad = new BatchResult
+                    {
+                        No = lastResults.Count + 1,
+                        Url = url,
+                        Host = "",
+                        Dns = "",
+                        Result = ex.Message,
+                        Action = "ERROR",
+                        Line = 0,
+                        Condition = ""
+                    };
+                    lastResults.Add(bad);
+                    AddGrid(bad);
+                }
+            }
+        }
+
+        private void AddGrid(BatchResult r)
+        {
+            grid.Rows.Add(
+                r.No,
+                r.Url,
+                r.Host,
+                r.Dns,
+                r.Result,
+                r.Action,
+                r.Line,
+                r.Condition);
+        }
+
+        private PacExecutionResult ExecutePac(string url, string host, string clientIp)
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out _))
+                throw new ArgumentException("URL 格式不正确。");
+
+            string dns = ResolveDns(host);
+            string cip = IsValidIp(clientIp) ? clientIp : GetLocalIPv4();
+
+            string instrumented = InstrumentPac(pacSource);
+
+            string recordedResult = "";
+            int recordedLine = 0;
+
+            var engine = new Engine(options =>
+            {
+                options.TimeoutInterval(TimeSpan.FromSeconds(30));
+            });
+
+            engine.SetValue("__pacRecord", new Func<int, string, string>((line, value) =>
+            {
+                if (recordedLine == 0)
+                {
+                    recordedLine = line;
+                    recordedResult = value;
+                }
+                return value;
+            }));
+
+            engine.SetValue("shExpMatch", new Func<string, string, bool>(ShExpMatch));
+            engine.SetValue("dnsResolve", new Func<string, string>(DnsResolveForPac));
+            engine.SetValue("isResolvable", new Func<string, bool>(IsResolvableForPac));
+            engine.SetValue("myIpAddress", new Func<string>(GetLocalIPv4));
+            engine.SetValue("dnsDomainIs", new Func<string, string, bool>((h, d) =>
+                h.Equals(d, StringComparison.OrdinalIgnoreCase) ||
+                h.EndsWith("." + d, StringComparison.OrdinalIgnoreCase)));
+            engine.SetValue("isPlainHostName", new Func<string, bool>(h =>
+                !h.Contains('.')));
+
+            engine.Execute(instrumented);
+
+            var fn = engine.GetValue("FindProxyForURL");
+            if (fn.IsUndefined())
+                throw new InvalidOperationException("PAC 中不存在 FindProxyForURL。");
+
+            var value = engine.Invoke(fn, url, host).ToString();
+
+            if (recordedLine == 0)
+                recordedResult = value;
+
+            int line = recordedLine;
+            string condition = line > 0 ? GetSourceLine(line).Trim() : "无条件默认返回";
+
+            string action = GetAction(recordedResult);
+
+            return new PacExecutionResult
+            {
+                Host = host,
+                Dns = dns,
+                Result = recordedResult,
+                Action = action,
+                Line = line,
+                Condition = condition
+            };
+        }
+
+        private string InstrumentPac(string source)
+        {
+            string[] lines = source.Replace("\r\n", "\n").Split('\n');
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string code = StripComment(lines[i]);
+
+                if (!Regex.IsMatch(code, @"\breturn\s+[""'][^""']*[""']"))
+                    continue;
+
+                int lineNo = i + 1;
+
+                lines[i] = new Regex(
+                    @"return\s+([""'])([^""']*)\1",
+                    RegexOptions.IgnoreCase)
+                    .Replace(
+                        lines[i],
+                        m => $"return __pacRecord({lineNo}, \"{EscapeJs(m.Groups[2].Value)}\")",
+                        1);
+            }
+
+            return string.Join("\r\n", lines);
+        }
+
+        private string GetSourceLine(int line)
+        {
+            string[] lines = pacSource.Replace("\r\n", "\n").Split('\n');
+            return line >= 1 && line <= lines.Length ? lines[line - 1] : "";
+        }
+
+        private static string EscapeJs(string value)
+        {
+            return value
+                .Replace("\\", "\\\\")
+                .Replace("\"", "\\\"");
+        }
+
+        private static string GetAction(string result)
+        {
+            if (result.StartsWith("DIRECT", StringComparison.OrdinalIgnoreCase))
+                return "DIRECT";
+
+            if (result.StartsWith("PROXY", StringComparison.OrdinalIgnoreCase))
+                return "PROXY";
+
+            if (result.StartsWith("SOCKS", StringComparison.OrdinalIgnoreCase))
+                return "SOCKS";
+
+            return "OTHER";
+        }
+
+        private string ResolveDns(string host)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+                return "";
+
+            if (IPAddress.TryParse(host, out _))
+                return host;
+
+            if (dnsCache.TryGetValue(host, out string? cached))
+                return cached;
+
+            try
+            {
+                IPAddress[] addresses = Dns.GetHostAddresses(host);
+                string value = string.Join(" | ",
+                    addresses.Select(x => x.ToString()));
+
+                dnsCache[host] = value;
+                return value;
+            }
+            catch
+            {
+                dnsCache[host] = "";
+                return "";
+            }
+        }
+
+        private string DnsResolveForPac(string host)
+        {
+            string dns = ResolveDns(host);
+            return dns.Split('|', StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => x.Trim())
+                .FirstOrDefault() ?? "";
+        }
+
+        private bool IsResolvableForPac(string host)
+        {
+            return !string.IsNullOrWhiteSpace(DnsResolveForPac(host));
+        }
+
+        private static bool ShExpMatch(string value, string pattern)
+        {
+            string regex = "^" + Regex.Escape(pattern)
+                .Replace(@"\*", ".*")
+                .Replace(@"\?", ".") + "$";
+
+            return Regex.IsMatch(
+                value ?? "",
+                regex,
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        }
+
+        private static string GetLocalIPv4()
+        {
+            try
+            {
+                foreach (IPAddress ip in Dns.GetHostAddresses(Dns.GetHostName()))
+                {
+                    if (ip.AddressFamily == AddressFamily.InterNetwork &&
+                        !IPAddress.IsLoopback(ip))
+                        return ip.ToString();
+                }
+            }
+            catch { }
+
+            return "127.0.0.1";
+        }
+
+        private static bool IsValidIp(string ip)
+        {
+            return IPAddress.TryParse(ip, out var address) &&
+                   address.AddressFamily == AddressFamily.InterNetwork;
+        }
+
+        private void TrySetHostFromUrl()
+        {
+            if (Uri.TryCreate(txtUrl.Text.Trim(), UriKind.Absolute, out var uri))
+                txtHost.Text = uri.Host;
+        }
+
+        private static string RemoveComments(string source)
+        {
+            return Regex.Replace(source, @"/\*.*?\*/|//[^\r\n]*",
+                "", RegexOptions.Singleline);
+        }
+
+        private static string StripComment(string line)
+        {
+            bool single = false, dbl = false, escape = false;
+
+            for (int i = 0; i < line.Length - 1; i++)
+            {
+                char c = line[i];
+
+                if (escape)
+                {
+                    escape = false;
+                    continue;
+                }
+
+                if ((single || dbl) && c == '\\')
+                {
+                    escape = true;
+                    continue;
+                }
+
+                if (!dbl && c == '\'') { single = !single; continue; }
+                if (!single && c == '"') { dbl = !dbl; continue; }
+
+                if (!single && !dbl && c == '/' && line[i + 1] == '/')
+                    return line[..i];
+            }
+
+            return line;
+        }
+
+        private string FormatResult(PacExecutionResult r)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("PAC 执行结果");
+            sb.AppendLine("================================");
+            sb.AppendLine($"Host     : {r.Host}");
+            sb.AppendLine($"目标IP   : {r.Dns}");
+            sb.AppendLine($"Result   : {r.Result}");
+            sb.AppendLine($"Action   : {r.Action}");
+            sb.AppendLine($"PAC Line : {(r.Line > 0 ? r.Line.ToString() : "未记录")}");
+            sb.AppendLine($"Condition: {r.Condition}");
+            return sb.ToString();
+        }
+
+        private void ExportCsv()
+        {
+            if (lastResults.Count == 0)
+            {
+                MessageBox.Show("没有可导出的批量结果。");
+                return;
+            }
+
+            using var dlg = new SaveFileDialog
+            {
+                Filter = "CSV 文件 (*.csv)|*.csv",
+                FileName = "PAC_Check_Result.csv"
+            };
+
+            if (dlg.ShowDialog() != DialogResult.OK)
+                return;
+
+            var sb = new StringBuilder();
+            sb.AppendLine("No,URL,Host,目标IP,Result,Action,PAC Line,命中规则");
+
+            foreach (var r in lastResults)
+            {
+                sb.AppendLine(string.Join(",",
+                    Csv(r.No.ToString()),
+                    Csv(r.Url),
+                    Csv(r.Host),
+                    Csv(r.Dns),
+                    Csv(r.Result),
+                    Csv(r.Action),
+                    Csv(r.Line.ToString()),
+                    Csv(r.Condition)));
+            }
+
+            File.WriteAllText(dlg.FileName, sb.ToString(), new UTF8Encoding(true));
+            MessageBox.Show("CSV 导出完成。");
+        }
+
+        private static string Csv(string value)
+        {
+            return "\"" + (value ?? "").Replace("\"", "\"\"") + "\"";
+        }
+
+        private enum RuleKind
+        {
+            Ip,
+            Domain,
+            Other
+        }
+
+        private sealed class PacRule
+        {
+            public int Line { get; set; }
+            public string Text { get; set; } = "";
+            public RuleKind Kind { get; set; }
+            public string Value { get; set; } = "";
+            public string ReturnValue { get; set; } = "";
+            public bool IsUnconditionalReturn { get; set; }
+            public string ConditionKey { get; set; } = "";
+            public string ConditionText { get; set; } = "";
+        }
+
+        private sealed class PacExecutionResult
+        {
+            public string Host { get; set; } = "";
+            public string Dns { get; set; } = "";
+            public string Result { get; set; } = "";
+            public string Action { get; set; } = "";
+            public int Line { get; set; }
+            public string Condition { get; set; } = "";
+        }
+
+        private sealed class BatchResult
+        {
+            public int No { get; set; }
+            public string Url { get; set; } = "";
+            public string Host { get; set; } = "";
+            public string Dns { get; set; } = "";
+            public string Result { get; set; } = "";
+            public string Action { get; set; } = "";
+            public int Line { get; set; }
+            public string Condition { get; set; } = "";
+        }
+        private string CheckPacCommentIssues()
+        {
+            var lines = pacSource.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            var issues = new List<(int Line, string Level, string Message, string Text, string Suggestion)>();
+            bool inBlockComment = false;
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string original = lines[i];
+                string trimmed = original.Trim();
+                if (trimmed.Length == 0) continue;
+
+                if (inBlockComment)
+                {
+                    if (original.IndexOf("*/", StringComparison.Ordinal) >= 0)
+                        inBlockComment = false;
+                    continue;
+                }
+
+                if (trimmed.StartsWith("/*", StringComparison.Ordinal))
+                {
+                    if (trimmed.IndexOf("*/", 2, StringComparison.Ordinal) < 0)
+                        inBlockComment = true;
+                    continue;
+                }
+
+                // 常见错误：把 // 注释写成 / 注释。
+                if (Regex.IsMatch(trimmed, @"^/\s+[^/].*$"))
+                {
+                    issues.Add((i + 1, "高",
+                        "疑似注释符号错误：行首使用单个 /，可能遗漏了第二个 /",
+                        trimmed,
+                        "如果这是注释，请修改为 //" + trimmed.Substring(1)));
+                    continue;
+                }
+
+                // 常见错误：代码后写成 ; / comment，而不是 ; // comment。
+                if (Regex.IsMatch(original, @";\s+/\s+[^/]"))
+                {
+                    issues.Add((i + 1, "高",
+                        "疑似注释符号错误：代码后出现单个 /，可能遗漏了第二个 /",
+                        trimmed,
+                        "请检查这里是否应该使用 // 开始注释。"));
+                    continue;
+                }
+
+                // 只在代码字符串之外检查 //，避免把 URL 中的 // 误报。
+                int commentPos = FindLineCommentOutsideStrings(original);
+
+                // 检查代码后疑似未注释的中文/韩文说明。
+                if (commentPos < 0 && LooksLikeExecutableLine(original) && LooksLikeUncommentedNote(original))
+                {
+                    issues.Add((i + 1, "中",
+                        "代码后疑似存在未注释的说明文字",
+                        trimmed,
+                        "如果后面的内容只是说明，请在说明前添加 //。"));
+                }
+            }
+
+            if (inBlockComment)
+            {
+                issues.Add((lines.Length, "高",
+                    "块注释没有结束，疑似遗漏 */",
+                    lines.Length > 0 ? lines[^1].Trim() : "",
+                    "请检查前面的 /* 是否应该补上 */。"));
+            }
+
+            var sb = new StringBuilder();
+            sb.AppendLine("注释 / 修改检查：");
+
+            if (issues.Count == 0)
+            {
+                sb.AppendLine("✓ 未发现明显的注释符号/修改遗漏问题");
+            }
+            else
+            {
+                sb.AppendLine($"⚠ 发现 {issues.Count} 个疑似问题：");
+                foreach (var issue in issues)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine($"[{issue.Level}] Line {issue.Line}  {issue.Message}");
+                    sb.AppendLine($"    {issue.Text}");
+                    sb.AppendLine($"    建议：{issue.Suggestion}");
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        private static bool LooksLikeReturnWithoutSemicolon(string line)
+        {
+            string t = line.Trim();
+            if (t.Length == 0) return false;
+            if (t.StartsWith("//", StringComparison.Ordinal)) return false;
+
+            // 只针对最常见的 PAC return 写法。
+            // 例如：
+            // return "DIRECT"
+            // { return "DIRECT" }
+            // return "PROXY 1.2.3.4:8080"
+            if (!Regex.IsMatch(t, @"\breturn\s+[""'][^""']*[""']\s*\}?\s*$",
+                RegexOptions.IgnoreCase))
+                return false;
+
+            // 如果最后一个有效字符已经是 ;，则正常。
+            if (t.EndsWith(";", StringComparison.Ordinal))
+                return false;
+
+            // 这种情况通常就是 return "..."} 或 return "..."
+            return true;
+        }
+
+        private static bool LooksLikeExecutableLine(string line)
+        {
+            string t = line.Trim();
+            return t.Contains("return", StringComparison.OrdinalIgnoreCase)
+                || t.Contains("shExpMatch", StringComparison.OrdinalIgnoreCase)
+                || t.Contains("dnsDomainIs", StringComparison.OrdinalIgnoreCase)
+                || t.Contains("dnsResolve", StringComparison.OrdinalIgnoreCase)
+                || t.Contains("isResolvable", StringComparison.OrdinalIgnoreCase)
+                || t.Contains("myIpAddress", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool LooksLikeUncommentedNote(string line)
+        {
+            string t = line.Trim();
+            if (t.StartsWith("//", StringComparison.Ordinal) || t.StartsWith("/*", StringComparison.Ordinal))
+                return false;
+
+            if (Regex.IsMatch(t, @"[\u4e00-\u9fff\uac00-\ud7af]"))
+                return true;
+
+            return Regex.IsMatch(t,
+                @";\s+(?:\d{4}[./-]\d{1,2}[./-]\d{1,2}|\d{6})\b");
+        }
+
+        private static int FindLineCommentOutsideStrings(string line)
+        {
+            bool single = false;
+            bool dbl = false;
+            bool escape = false;
+
+            for (int i = 0; i + 1 < line.Length; i++)
+            {
+                char c = line[i];
+
+                if (escape)
+                {
+                    escape = false;
+                    continue;
+                }
+
+                if ((single || dbl) && c == '\\')
+                {
+                    escape = true;
+                    continue;
+                }
+
+                if (!dbl && c == '\'')
+                {
+                    single = !single;
+                    continue;
+                }
+
+                if (!single && c == '"')
+                {
+                    dbl = !dbl;
+                    continue;
+                }
+
+                if (!single && !dbl && c == '/' && line[i + 1] == '/')
+                    return i;
+            }
+
+            return -1;
+        }
+
+    }
+}
